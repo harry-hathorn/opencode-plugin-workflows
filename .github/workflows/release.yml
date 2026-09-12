@@ -1,0 +1,45 @@
+name: release
+
+# On a published GitHub Release: publish to npm. Also on manual dispatch.
+# Secrets required: NPM_TOKEN.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish-npm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      # Clean-room smoke test of the publishable artifact: pack the tarball,
+      # install it into an empty dir (exactly what an opencode install does),
+      # then import the plugin entry and assert its shape. The bundle is
+      # self-contained (acorn/zod ship inside dist), so a missing-export or
+      # unresolved-import bug fails here and blocks the publish before a broken
+      # package reaches npm.
+      - name: Smoke-test publishable tarball
+        run: |
+          npm pack
+          mkdir -p /tmp/smoke && cd /tmp/smoke
+          npm init -y >/dev/null
+          npm install "$GITHUB_WORKSPACE"/opencode-plugin-workflows-*.tgz
+          node --input-type=module -e "
+            const m = await import('opencode-plugin-workflows');
+            if (!m.default || m.default.id !== 'opencode-plugin-workflows' || typeof m.default.server !== 'function')
+              throw new Error('unexpected plugin export shape');
+            console.log('smoke: plugin entry imports and resolves');
+          "
+      - run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
