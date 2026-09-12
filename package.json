@@ -1,0 +1,57 @@
+{
+	"name": "opencode-plugin-workflows",
+	"version": "0.1.0",
+	"description": "Deterministic multi-agent workflow orchestration for opencode — a shareable plugin. JavaScript orchestration scripts (agent/parallel/pipeline/phase/log/budget) fan out over real subagent sessions, with a journal that makes every run resumable from cache.",
+	"type": "module",
+	"main": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"license": "MIT",
+	"author": "Harry Hathorn (https://github.com/harry-hathorn)",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/harry-hathorn/opencode-plugin-workflows.git"
+	},
+	"bugs": {
+		"url": "https://github.com/harry-hathorn/opencode-plugin-workflows/issues"
+	},
+	"engines": {
+		"node": ">=20",
+		"opencode": ">=1.14.0"
+	},
+	"files": [
+		"dist"
+	],
+	"keywords": [
+		"opencode-plugin",
+		"opencode",
+		"workflows",
+		"multi-agent",
+		"orchestration",
+		"subagents",
+		"agent",
+		"ai"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
+	"scripts": {
+		"build": "tsup",
+		"dev": "tsup --watch",
+		"test": "bun test",
+		"typecheck": "tsc --noEmit",
+		"lint": "biome check src test",
+		"format": "biome format --write src test",
+		"prepublishOnly": "npm run build"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.5.0",
+		"@opencode-ai/plugin": "^1.18.30",
+		"@opencode-ai/sdk": "^1.18.30",
+		"@types/node": "^24.0.0",
+		"acorn": "^8.15.0",
+		"acorn-walk": "^8.3.0",
+		"tsup": "^8.5.0",
+		"typescript": "^5.7.0",
+		"zod": "4.1.8"
+	}
+}
