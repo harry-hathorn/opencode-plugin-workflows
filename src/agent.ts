@@ -1,16 +1,28 @@
 /**
- * Session-backed agent() — the subagent spawn, on opencode primitives:
+ * Session-backed agent() — the subagent spawn, on opencode V2 primitives:
  *
- *   client.session.create({parentID, agent: "workflow-subagent", permission})
- *   client.session.prompt({parts, format?})  // blocks for the whole agentic loop
+ *   client.session.create({parentID, agent, model, permissions, metadata})
+ *   client.session.prompt({sessionID, text})   // admits the user turn
+ *   client.session.wait({sessionID})           // blocks for the agentic loop
+ *   client.session.context({sessionID})        // settled transcript
  *
- * Extraction mirrors the built-in task tool (packages/opencode/src/tool/task.ts):
- * fail on info.error / last errored tool part, else findLast text part.
- * Structured mode reads (info as any).structured and retries on
- * StructuredOutputError with a fresh session (server retryCount is dead code).
+ * V2 has no per-prompt system/format override and no StructuredOutput tool:
+ *  - the worker contract (verbatim return value) is a preamble on the prompt
+ *    text (OpenCode 2.2.5 plugins cannot register agents), and
+ *  - schema mode instructs the worker to reply with raw JSON only, which is
+ *    parsed tolerantly here and retried on a fresh session (cap 5).
+ *
+ * Extraction mirrors the built-in subagent flow: fail on info.error / last
+ * errored tool call, else findLast text part.
  */
 
-import { CUSTOM_AGENT_NOTE_SCHEMA, CUSTOM_AGENT_NOTE_TEXT, SUBAGENT_AGENT_NAME, worktreeNote } from "./prompts";
+import {
+	CUSTOM_AGENT_NOTE_SCHEMA,
+	CUSTOM_AGENT_NOTE_TEXT,
+	WORKER_NOTE_SCHEMA,
+	WORKER_PREAMBLE,
+	worktreeNote,
+} from "./prompts";
 import type { AgentFn, AgentOptions } from "./runner";
 import type { PermissionRule } from "./state";
 
@@ -23,16 +35,19 @@ type LooseRecord = Record<string, any>;
 
 export interface OpencodeClient {
 	session: {
-		create(args: { body: Record<string, unknown> }): Promise<{ data: { id: string } }>;
-		prompt(args: {
-			path: { id: string };
-			body: Record<string, unknown>;
-		}): Promise<{ data: { info: LooseRecord; parts: Array<LooseRecord> } }>;
-		abort(args: { path: { id: string } }): Promise<unknown>;
-		get(args: { path: { id: string } }): Promise<{ data: LooseRecord }>;
-		messages(args: {
-			path: { id: string };
-		}): Promise<{ data: Array<{ info: LooseRecord; parts: Array<LooseRecord> }> }>;
+		create(input: {
+			parentID?: string;
+			title?: string;
+			agent?: string;
+			model?: { id: string; providerID: string; variant?: string };
+			metadata?: Record<string, unknown>;
+			permissions?: PermissionRule[];
+		}): Promise<LooseRecord>;
+		prompt(input: { sessionID: string; text: string }): Promise<unknown>;
+		wait(input: { sessionID: string }): Promise<void>;
+		interrupt(input: { sessionID: string; resume?: boolean }): Promise<unknown>;
+		get(input: { sessionID: string }): Promise<LooseRecord>;
+		context(input: { sessionID: string }): Promise<LooseRecord[]>;
 	};
 }
 
@@ -52,18 +67,14 @@ async function fetchParentInfo(init: SessionAgentInit): Promise<ParentInfo> {
 	const denies: PermissionRule[] = [];
 	let model: ParentInfo["model"];
 	try {
-		const res = await init.client.session.get({ path: { id: init.parentSessionID } });
-		const session = res.data ?? {};
-		if (session.modelID && session.model?.providerID) {
-			model = { providerID: session.model.providerID, modelID: session.modelID };
-		} else if (session.model?.modelID) {
-			model = { providerID: session.model.providerID, modelID: session.model.modelID };
+		const session = await init.client.session.get({ sessionID: init.parentSessionID });
+		const rec = session ?? {};
+		if (rec.model?.id && rec.model?.providerID) {
+			model = { providerID: rec.model.providerID, modelID: rec.model.id };
 		}
-		// inherit the parent session's deny rules (deriveSubagentSessionPermission)
-		for (const rule of (session.permission ?? []) as PermissionRule[]) {
-			if (rule && typeof rule === "object" && (rule.action === "deny" || rule.permission === "external_directory")) {
-				denies.push(rule);
-			}
+		// inherit the parent session's deny rules (children run with them too)
+		for (const rule of (rec.permissions ?? []) as PermissionRule[]) {
+			if (rule && typeof rule === "object" && rule.effect === "deny") denies.push(rule);
 		}
 	} catch {
 		// parent session unreadable — proceed with defaults
@@ -79,19 +90,17 @@ function parseModelSpec(spec: string): { providerID: string; modelID: string } |
 }
 
 /**
- * Build the worker ruleset: inherited denies + external_directory rules,
- * disallowedTools denies, and hard denies for task/todowrite (workflow children
- * cannot spawn tasks or write todos — keeps the workflow tree flat and free
- * of runaway nested runs).
+ * Build the worker ruleset: inherited denies, disallowedTools denies, and a
+ * hard deny for subagent spawning (workflow children cannot spawn tasks —
+ * keeps the workflow tree flat and free of runaway nested runs).
  */
 function workerRuleset(parent: ParentInfo, opts: AgentOptions): PermissionRule[] {
 	const rules: PermissionRule[] = [...parent.denies];
 	for (const tool of opts.disallowedTools ?? []) {
 		if (typeof tool !== "string" || !tool.trim()) continue;
-		rules.push({ permission: tool.trim(), pattern: "*", action: "deny" });
+		rules.push({ action: tool.trim(), resource: "*", effect: "deny" });
 	}
-	rules.push({ permission: "task", pattern: "*", action: "deny" });
-	rules.push({ permission: "todowrite", pattern: "*", action: "deny" });
+	rules.push({ action: "subagent", resource: "*", effect: "deny" });
 	return rules;
 }
 
@@ -100,34 +109,75 @@ interface PromptOutcome {
 	parts: Array<LooseRecord>;
 }
 
+/**
+ * Tolerant JSON extraction from a worker's final text: strips code fences,
+ * then scans for the first balanced JSON value. Returns undefined when no
+ * complete value parses.
+ */
+function parseLooseJson(text: string): unknown {
+	const trimmed = text.trim();
+	const unfenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/.exec(trimmed)?.[1] ?? trimmed;
+	for (let i = 0; i < unfenced.length; i++) {
+		const opener = unfenced[i];
+		if (opener !== "{" && opener !== "[") continue;
+		let depth = 0;
+		let inString = false;
+		let escaped = false;
+		for (let j = i; j < unfenced.length; j++) {
+			const ch = unfenced[j];
+			if (inString) {
+				if (escaped) escaped = false;
+				else if (ch === "\\") escaped = true;
+				else if (ch === '"') inString = false;
+				continue;
+			}
+			if (ch === '"') inString = true;
+			else if (ch === opener) depth++;
+			else if (ch === (opener === "{" ? "}" : "]")) {
+				depth--;
+				if (depth === 0) {
+					try {
+						return JSON.parse(unfenced.slice(i, j + 1));
+					} catch {
+						break; // torn value — try the next opener
+					}
+				}
+			}
+		}
+	}
+	return undefined;
+}
+
+/**
+ * One worker turn: create a child session, submit the prompt (worker preamble
+ * + task + mode notes), wait for the loop to settle, and read the transcript.
+ */
 async function promptOnce(
 	init: SessionAgentInit,
 	sessionID: string,
 	prompt: string,
 	opts: AgentOptions,
-	parent: ParentInfo,
 ): Promise<PromptOutcome> {
-	const body: Record<string, unknown> = {
-		parts: [{ type: "text", text: prompt }],
-	};
-	const model = opts.model ? parseModelSpec(opts.model) : parent.model;
-	if (model) body.model = model;
+	const sections: string[] = [];
+	// The worker contract rides on the prompt (V2 has no per-session system
+	// override from plugins): default workers get the full preamble; custom
+	// agentTypes keep their own system prompt and get the shorter note.
+	if (!opts.agentType || opts.agentType === WORKER_DEFAULT_AGENT) sections.push(WORKER_PREAMBLE);
+	sections.push(prompt);
 	if (opts.schema) {
-		body.format = { type: "json_schema", schema: opts.schema };
+		sections.push(`${WORKER_NOTE_SCHEMA}\n\nReply with JSON matching this schema:\n${JSON.stringify(opts.schema)}`);
+	} else if (opts.agentType && opts.agentType !== WORKER_DEFAULT_AGENT) {
+		sections.push(CUSTOM_AGENT_NOTE_TEXT);
 	}
-	// PromptInput.system APPENDS to the agent's system prompt:
-	//  - schema mode → the schema note (MUST call StructuredOutput exactly once)
-	//  - custom agentType in text mode → the custom-agent note (verbatim return value)
-	if (opts.schema) {
-		body.system = CUSTOM_AGENT_NOTE_SCHEMA;
-	} else if (opts.agentType && opts.agentType !== SUBAGENT_AGENT_NAME) {
-		body.system = CUSTOM_AGENT_NOTE_TEXT;
-	}
-	const res = await init.client.session.prompt({ path: { id: sessionID }, body });
-	return { info: res.data.info, parts: res.data.parts };
+
+	await init.client.session.prompt({ sessionID, text: sections.join("\n\n") });
+	await init.client.session.wait({ sessionID });
+	const messages = await init.client.session.context({ sessionID });
+	const last = messages.findLast((m) => m?.type === "assistant") ?? {};
+	return { info: last, parts: Array.isArray(last.content) ? last.content : [] };
 }
 
-/** Set when the stall watchdog aborted the session (distinct from user abort). */
+/** Set when the stall watchdog interrupted the session (distinct from user abort). */
 class WorkflowStallError extends Error {
 	constructor(stallMs: number) {
 		super(`agent stalled: no session activity for ${stallMs}ms`);
@@ -145,8 +195,8 @@ const DEFAULT_STALL_MS = 180_000;
 const MAX_STALL_RETRIES = 5;
 
 /**
- * promptOnce + stall watchdog: poll the session's message list for activity;
- * when nothing has moved for stallMs, abort the session (promptOnce then
+ * promptOnce + stall watchdog: poll the session's transcript for activity;
+ * when nothing has moved for stallMs, interrupt the session (promptOnce then
  * settles) and raise WorkflowStallError so the caller retries on a fresh
  * session. stallMs <= 0 disables the watchdog.
  */
@@ -155,7 +205,6 @@ async function promptWithStallWatch(
 	sessionID: string,
 	prompt: string,
 	opts: AgentOptions,
-	parent: ParentInfo,
 ): Promise<PromptOutcome> {
 	const stallMs = typeof opts.stallMs === "number" && opts.stallMs > 0 ? opts.stallMs : DEFAULT_STALL_MS;
 	let lastActivity = Date.now();
@@ -164,12 +213,12 @@ async function promptWithStallWatch(
 		() => {
 			void (async () => {
 				try {
-					const res = await init.client.session.messages({ path: { id: sessionID } });
+					const messages = await init.client.session.context({ sessionID });
 					let newest = 0;
-					for (const m of res.data ?? []) {
-						const t = m.info?.time;
+					for (const m of messages ?? []) {
+						const t = m?.time;
 						if (!t) continue;
-						newest = Math.max(newest, t.created ?? 0, t.completed ?? 0);
+						newest = Math.max(newest, t.created ?? 0, t.completed ?? 0, t.streamed ?? 0);
 					}
 					if (newest > 0) lastActivity = Math.max(lastActivity, newest);
 				} catch {
@@ -177,14 +226,14 @@ async function promptWithStallWatch(
 				}
 				if (!stalled && Date.now() - lastActivity > stallMs) {
 					stalled = true;
-					void init.client.session.abort({ path: { id: sessionID } }).catch(() => {});
+					void init.client.session.interrupt({ sessionID, resume: false }).catch(() => {});
 				}
 			})();
 		},
 		Math.min(15_000, Math.max(5_000, Math.floor(stallMs / 6))),
 	);
 	try {
-		const outcome = await promptOnce(init, sessionID, prompt, opts, parent);
+		const outcome = await promptOnce(init, sessionID, prompt, opts);
 		if (stalled) throw new WorkflowStallError(stallMs);
 		return outcome;
 	} finally {
@@ -192,19 +241,25 @@ async function promptWithStallWatch(
 	}
 }
 
-/** Text-mode extraction, exactly like the built-in task tool. */
+/** Text-mode extraction, like the built-in subagent flow. */
 function extractText(outcome: PromptOutcome): { text: string } | { error: string } {
 	const { info, parts } = outcome;
 	if (info?.error) {
-		return { error: `assistant error: ${info.error.name ?? "UnknownError"}: ${info.error.data?.message ?? ""}` };
+		const err = info.error as LooseRecord;
+		return {
+			error: `assistant error: ${err.name ?? err.message ?? "UnknownError"}: ${err.data?.message ?? err.message ?? ""}`,
+		};
 	}
-	const failed = parts.findLast((p) => p.type === "tool" && p.state?.status === "error");
+	const failed = parts.findLast((p) => p?.type === "tool" && p?.state?.status === "error");
 	if (failed) {
-		return { error: `tool ${failed.tool} failed: ${failed.state?.error ?? "unknown error"}` };
+		return { error: `tool ${failed.name ?? failed.tool} failed: ${failed.state?.error ?? "unknown error"}` };
 	}
-	const text = parts.findLast((p) => p.type === "text")?.text ?? "";
+	const text = parts.findLast((p) => p?.type === "text")?.text ?? "";
 	return { text };
 }
+
+/** The agent used for workflow workers when a script does not name one. */
+export const WORKER_DEFAULT_AGENT = "build";
 
 /**
  * Create the session-backed AgentFn. One parent lookup per run; each agent()
@@ -216,8 +271,8 @@ export async function createSessionAgent(init: SessionAgentInit): Promise<AgentF
 	return async (prompt, opts, call) => {
 		const promptParts: string[] = [prompt];
 		if (opts.isolation === "worktree") {
-			// v1: prompt-framed worktree isolation is wired by the tool layer via
-			// opts; the note is appended here when a worktree path was attached.
+			// worktree isolation is wired by the tool layer via opts; the note is
+			// appended here when a worktree path was attached.
 			const wtPath = (opts as AgentOptions & { worktreePath?: string }).worktreePath;
 			if (wtPath) promptParts.push(worktreeNote(wtPath, init.directory));
 		}
@@ -229,21 +284,23 @@ export async function createSessionAgent(init: SessionAgentInit): Promise<AgentF
 		for (;;) {
 			let sessionID: string;
 			try {
+				const modelSpec = opts.model ? parseModelSpec(opts.model) : parent.model;
 				const created = await init.client.session.create({
-					body: {
-						parentID: init.parentSessionID,
-						title: `${opts.label ?? prompt.slice(0, 40)} (@${opts.agentType ?? SUBAGENT_AGENT_NAME} workflow)`,
-						agent: opts.agentType ?? SUBAGENT_AGENT_NAME,
-						permission: workerRuleset(parent, opts),
-						metadata: {
-							runId: call.runId,
-							agentIndex: call.index,
-							label: opts.label,
-							phase: opts.phase,
-						},
+					parentID: init.parentSessionID,
+					title: `${opts.label ?? prompt.slice(0, 40)} (@${opts.agentType ?? WORKER_DEFAULT_AGENT} workflow)`,
+					agent: opts.agentType ?? WORKER_DEFAULT_AGENT,
+					model: modelSpec ? { id: modelSpec.modelID, providerID: modelSpec.providerID } : undefined,
+					permissions: workerRuleset(parent, opts),
+					metadata: {
+						runId: call.runId,
+						agentIndex: call.index,
+						agentId: call.agentId,
+						label: opts.label,
+						phase: opts.phase,
+						attempt: attempt + 1,
 					},
 				});
-				sessionID = created.data.id;
+				sessionID = created.id;
 				call.report({ sessionId: sessionID });
 			} catch (err) {
 				call.report({ state: "error", error: `session create failed: ${(err as Error).message}` });
@@ -251,13 +308,13 @@ export async function createSessionAgent(init: SessionAgentInit): Promise<AgentF
 			}
 
 			const onAbort = () => {
-				void init.client.session.abort({ path: { id: sessionID } }).catch(() => {});
+				void init.client.session.interrupt({ sessionID, resume: false }).catch(() => {});
 			};
 			call.signal.addEventListener("abort", onAbort, { once: true });
 
 			let outcome: PromptOutcome;
 			try {
-				outcome = await promptWithStallWatch(init, sessionID, finalPrompt, opts, parent);
+				outcome = await promptWithStallWatch(init, sessionID, finalPrompt, opts);
 			} catch (err) {
 				call.signal.removeEventListener("abort", onAbort);
 				if ((err as Error).name === "WorkflowStallError") {
@@ -281,33 +338,27 @@ export async function createSessionAgent(init: SessionAgentInit): Promise<AgentF
 			// usage accounting
 			const tokens = outcome.info?.tokens;
 			if (tokens && typeof tokens.output === "number") call.addTokens(tokens.output);
-			const toolCalls = outcome.parts.filter((p) => p.type === "tool").length;
+			const toolCalls = outcome.parts.filter((p) => p?.type === "tool").length;
 			if (toolCalls) call.addToolCalls(toolCalls);
 
 			if (opts.schema) {
-				const structured = (outcome.info as { structured?: unknown }).structured;
+				const extracted = extractText(outcome);
+				if ("error" in extracted) {
+					call.report({ state: "error", error: throttleHint(`schema output failed: ${extracted.error}`) });
+					return null;
+				}
+				const structured = parseLooseJson(extracted.text);
 				if (structured !== undefined) {
 					return { value: structured };
 				}
-				const errName = outcome.info?.error?.name;
-				if (errName === "StructuredOutputError" && attempt < MAX_STRUCTURED_OUTPUT_RETRIES) {
+				if (attempt < MAX_STRUCTURED_OUTPUT_RETRIES) {
 					attempt++;
 					call.report({ state: "progress", attempt, lastAttemptReason: "schema validation" });
 					continue; // fresh session, same prompt
 				}
-				if (outcome.info?.error) {
-					call.report({
-						state: "error",
-						error: throttleHint(
-							`schema output failed: ${outcome.info.error.name}: ${outcome.info.error.data?.message ?? ""}`,
-						),
-					});
-					return null;
-				}
-				// structured missing without an error — treat as failure
 				call.report({
 					state: "error",
-					error: "schema output missing: worker finished without calling StructuredOutput",
+					error: "schema output missing: worker finished without returning parseable JSON",
 				});
 				return null;
 			}

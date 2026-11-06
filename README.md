@@ -15,13 +15,19 @@
 ```
 
 ```text
- opencode — /workflows
+ opencode — workflows dashboard                                  <leader>d
 
-  → review-changes [wf_9f3k2m1a8b2c] — Verify · 2m14s
-      Find ............ 6/6 done (3 cached)
-      Verify .......... 4/7 running
-      Synthesize ...... pending
-    41,203 tokens · 12/16 agents
+ ◐ review-changes [wf_9f3k2m1a8b2c]                       12/16 agents
+ running · 2m14s · 41.2k tok · filter: all
+ ▸ Find (6/6)
+   ↻ scan:src · 8.1k tok · 22s
+   ✔ scan:test · 6.4k tok · 19s
+ ▸ Verify (4/7)
+   ✔ verify:null-deref · 5.2k tok · 31s
+   ◐ verify:race · 3.9k tok · 12s
+ ▸ Synthesize
+
+ j/k select · return open · r runs · f filter · l logs · p pause · x kill · ? help · q close
 ```
 
 # opencode-plugin-workflows
@@ -46,9 +52,10 @@ decides *how*, with loops, barriers, and fan-out you can reason about.
 > — no proprietary surface. Save a script under `.opencode/workflows/` and it becomes a named
 > workflow with its own slash command.
 
-> **Workers are real sessions, not prompts-in-a-trenchcoat.** Every `agent()` spawns a
-> `workflow-subagent` session under the calling session, visible in the TUI, with its own tool
-> loop, token usage, and permissions (task/todo spawning denied, parent denies inherited).
+> **Workers are real sessions, not prompts-in-a-trenchcoat.** Every `agent()` spawns a child
+> session (the `build` agent, or a custom `agentType`) under the calling session, visible in the
+> TUI, with its own tool loop, token usage, and permissions (subagent spawning denied, parent
+> denies inherited). The verbatim-return worker contract rides on each worker prompt.
 
 > **Every run leaves a journal.** Each agent's (prompt, opts) is chained into a cache key; kill,
 > pause, edit the script, relaunch with `resumeFromRunId`, and the longest unchanged prefix
@@ -56,7 +63,7 @@ decides *how*, with loops, barriers, and fan-out you can reason about.
 
 ```text
  script ──▶ compile ──▶ sandbox ──▶ runner ──▶ opencode sessions
-(name /     acorn:      node:vm,    journal,   workflow-subagent
+(name /     acorn:      node:vm,    journal,   worker sessions
  inline /   meta must   hardened    chained    agents: real
  scriptPath be a pure   context —   cache      agentic loops
  + args)    literal,    no Date /   keys →     under the
@@ -79,8 +86,9 @@ decides *how*, with loops, barriers, and fan-out you can reason about.
 | `workflow` tool | Compile + run a script — inline `script`, saved `name`, or `scriptPath`; `args` in, `resumeFromRunId` to resume. |
 | `workflow_status` tool | List running + recent runs with live progress (agents done/total, tokens, phase, errors). The source of runIds. |
 | `workflow_control` tool | Kill or pause a run by runId. Both abort in-flight agents; both keep completed results resumable. |
-| `workflow-subagent` agent | The registered subagent your workers run as — owns the worker system prompt. |
+| Worker contract | The verbatim-return contract each worker runs under (prompt preamble in v0.4; workers default to the `build` agent). |
 | `/workflows` + `/<name>` commands | One slash command per saved workflow, plus `/workflows` for status/kill via the tools above. |
+| TUI dashboard | Inline status panel above the composer while a run is live, plus sidebar section and full-screen dashboard (`<leader>d`): live phase→agent tree, run switcher, filters, jump into any agent session, pause/kill. Loads with the same `plugins` entry — see [TUI dashboard](#tui-dashboard). |
 
 ## Quick start
 
@@ -92,15 +100,18 @@ Add to `.opencode/opencode.json` (project) or `~/.config/opencode/opencode.json`
 
 ```json
 {
-  "plugin": ["opencode-plugin-workflows"]
+  "plugins": ["opencode-plugin-workflows"]
 }
 ```
+
+One entry loads every part — the tools and commands in the server, the sidebar section and
+dashboard in the TUI. (Local checkout: `"file:///abs/path/to/opencode-plugin-workflows"`.)
 
 Launching a workflow pops **one** approval dialog showing the full script. Pre-allow it:
 
 ```json
 {
-  "permission": { "workflow": "allow" }
+  "permissions": [{ "action": "workflow", "resource": "*", "effect": "allow" }]
 }
 ```
 
@@ -158,10 +169,10 @@ async context (`await` works at top level), with these hooks:
 | --- | --- |
 | `label` | Display label in progress and journal. |
 | `phase` | Explicit progress group (use inside stages). |
-| `schema` | JSON Schema (`{type:'object', ...}`, `required ⊆ properties`) — forces a StructuredOutput tool call; validation and retries happen at the tool-call layer. |
+| `schema` | JSON Schema (`{type:'object', ...}`, `required ⊆ properties`) — the worker must reply with raw JSON matching it; the plugin parses, validates, and retries on a fresh session (cap 5). |
 | `model` | `"provider/model"` for this call only. Omit to inherit the session model — almost always right. |
 | `effort` | Reasoning-effort override; omit to inherit. |
-| `agentType` | Custom subagent type instead of `workflow-subagent`; composes with `schema`. |
+| `agentType` | Custom agent instead of the default `build` agent; composes with `schema`. |
 | `disallowedTools` | Per-call deny list for the worker. |
 | `stallMs` | Stall-watchdog override (default 180 000 ms; ≤ 0 disables). |
 | `isolation` | `'worktree'` — accepted in v0.1 but runs in the shared directory; see [limitations](#limitations-pre-10). |
@@ -248,6 +259,93 @@ Workers that stall (no session activity for 180 s by default) are aborted and re
 fresh session, up to 5 attempts; rate-limit-shaped terminal errors are tagged with a
 throttling hint and the run stays resumable.
 
+## TUI dashboard
+
+The package ships two entries: the **server half** (tools, commands) and a **TUI half**
+(`opencode-plugin-workflows/tui`) that renders inside the opencode TUI. Registering the
+package once under `plugins` loads both — the TUI loads the TUI parts of every plugin its
+server loads:
+
+```json
+{
+  "plugins": ["opencode-plugin-workflows"]
+}
+```
+
+**Sidebar.** Sessions that have run workflows get a Workflows section (between LSP and Todo):
+the latest run — status glyph, `name [runId]`, agents done/total, tokens, current phase,
+elapsed — plus up to two recent settled runs. Click it to open the dashboard. It appears only
+when there is something to show.
+
+**Inline panel.** While a run is live, a one-line strip appears just above the composer — the
+bullet. Press `<leader>d` (or the palette's "Workflows: status panel") to highlight it, `enter`
+to expand a bordered status card, `enter` again for the full dashboard:
+
+```text
+ ❯ verify-slow                                                  3/4 agents · 8.4s
+   enter expand · x stop · p pause · esc back
+```
+
+```text
+ ╭──────────────────────────────────────────────────────────╮
+ │◐ verify-slow                        3/4 agents · 0 tok · 8.4s│
+ │Phases                run · 4 agents                        │
+ │❯ 1 run 3/4           ✔ agent-a · 1.2k tok · 22s            │
+ │                      ◐ agent-b · 0.9k tok · 12s            │
+ │j/k phase · enter full view · x kill · p pause · esc back   │
+ ╰──────────────────────────────────────────────────────────╯
+```
+
+| key | action |
+| --- | --- |
+| `<leader>d` / palette "Workflows: status panel" | highlight the strip |
+| `enter` | strip → card → full dashboard |
+| `j` / `k`, `g` / `G` | move the phase cursor (card) |
+| `x` / `p` | kill / pause the run (confirmation dialog) |
+| `esc` / `←` | card → strip → composer, one level per press |
+
+The panel exists only while a run is live — it disappears the moment the run settles. The
+composer itself is the stock one, untouched: the panel is appended above it through the
+`session.composer.top` slot.
+
+**Dashboard.** Open with `<leader>d` (default leader: `ctrl+x`), the command palette
+("Workflows: dashboard"), or `enter` on the inline card. Full-screen and keyboard-driven:
+
+```text
+ ◐ review-changes [wf_9f3k2m1a8b2c]                       12/16 agents
+ running · 2m14s · 41.2k tok · filter: all
+ ▸ Find (6/6)
+   ↻ scan:src · 8.1k tok · 22s
+   ✔ scan:test · 6.4k tok · 19s
+ ▸ Verify (4/7)
+   ✔ verify:null-deref · 5.2k tok · 31s
+   ◐ verify:race · 3.9k tok · 12s
+ ▸ Synthesize
+
+ j/k select · return open · r runs · f filter · l logs · p pause · x kill · ? help · q close
+```
+
+| key | action |
+| --- | --- |
+| `j` / `k`, `g` / `G` | next / previous agent · first / last |
+| `enter` | jump into the selected agent's session (`q` from there returns) |
+| `r` | run switcher — live runs first, then recent settled runs |
+| `f` | cycle filter: all → running → done → error |
+| `l` | toggle narrator `log()` lines (hidden by default) |
+| `p` / `x` | pause / kill the run (confirmation dialog) |
+| `?` | help |
+| `q` / `esc` | close |
+
+Agent glyphs: `◐` working · `✔` done · `↻` replayed from cache · `◦` skipped · `✗` error.
+Run glyphs: `◐` running · `✔` completed · `✗` failed · `⊘` killed · `⏸` paused.
+
+**Live runs are visible from launch.** The journal is written as agents start, so the sidebar
+and dashboard surface a running run within a couple of seconds — with per-agent state — while
+the workflow tool call is still in flight (token totals appear once it settles). Pause/kill
+from the dashboard writes a control op the server picks up and applies to the live run; the
+view settles to `⏸ paused` / `⊘ killed` when the run does, and the journal keeps completed
+results resumable exactly like a `workflow_control` kill — `resumeFromRunId` as above.
+
 ## Configuration
 
 | Knob | Where | Effect |
@@ -265,16 +363,19 @@ throttling hint and the run stays resumable.
   is planned.
 - **Nesting is one level.** A `workflow()` child shares caps, journal, abort, and budget;
   `workflow()` inside that child throws.
-- **Runs are synchronous tool calls** with live progress via the tool part — no detached or
-  background runs yet.
-- **`/workflows` is model-mediated** (it relays `workflow_status`/`workflow_control`), not a
-  TUI dashboard.
+- **Runs are synchronous tool calls** — no detached or background runs yet.
+- **Live totals come from the journal.** Progress metadata streams via `session.tool.progress`
+  events, but agent token/tool-call totals are only final at settle — the dashboard derives
+  live state from the on-disk journal, and totals firm up when a run settles.
+- **`/workflows` is model-mediated** (it relays `workflow_status`/`workflow_control`) — the
+  dashboard is the human surface.
 
 ## Testing
 
 Deterministic and hermetic — no LLM, no network. `agent()` is stubbed at the runner boundary;
-the compiler, sandbox, journal chaining/resume, registry precedence, and the nesting/budget/caps
-pools are exercised directly (70 tests).
+the compiler, sandbox, journal chaining/resume, registry precedence, the nesting/budget/caps
+pools, the control-bridge codec/drainer, and the TUI data derivations (evidence merge,
+supersession, live-run discovery, dashboard flattening) are exercised directly (122 tests).
 
 ```bash
 npm install
@@ -292,8 +393,9 @@ test on every PR; releases publish to npm from the published GitHub release
 (see [`.github/workflows/`](./.github/workflows/)).
 
 ```text
-src/{index,tool,agent,compile,sandbox,runner,journal,registry,commands,status,prompts}.ts
-test/{compile,sandbox,journal,runner,registry}.test.ts
+src/{index,tool,agent,compile,sandbox,runner,journal,registry,commands,status,prompts,control,state,paths}.ts
+src/tui/{index,sidebar,dashboard,store,data}.ts(x)
+test/{compile,sandbox,journal,runner,registry,control,tui-data}.test.ts
 .github/workflows/{ci,release}.yml
 ```
 

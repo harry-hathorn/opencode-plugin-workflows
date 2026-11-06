@@ -2,9 +2,10 @@
  * Journal & run-artifact storage under opencode's data dir:
  *
  *   ~/.local/share/opencode/workflows/<runId>/
- *     journal.jsonl        # {launched|started|result|failed} rows, resume cache
+ *     journal.jsonl        # {launched|started|result|failed} rows (ts, error), resume cache
  *     script.js            # persisted script for this invocation
  *     snapshot.json        # written on settle (status, result, progress rows)
+ *     control.jsonl        # TUI → server control ops (kill/pause), 0600
  *
  * Cache keys are chained: v2:sha256(prompt \0 canonicalOpts \0 prevKey) — editing
  * agent N's prompt/opts invalidates every subsequent key, which is what makes
@@ -12,22 +13,10 @@
  */
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 
-export function runsRoot(): string {
-	const xdg = process.env.XDG_DATA_HOME;
-	const base = xdg && path.isAbsolute(xdg) ? xdg : path.join(os.homedir(), ".local", "share");
-	return path.join(base, "opencode", "workflows");
-}
-
-export function runDir(runId: string): string {
-	return path.join(runsRoot(), runId);
-}
-
-export function journalPath(runId: string): string {
-	return path.join(runDir(runId), "journal.jsonl");
-}
+// Run-directory layout lives in paths.ts so the TUI bundle can share it.
+export { journalPath, runDir, runsRoot } from "./paths";
 
 /** `wf_` + first 12 chars of a UUID. */
 export function newRunId(): string {
@@ -93,6 +82,8 @@ export interface JournalRow {
 	phase?: string;
 	result?: unknown;
 	error?: string;
+	/** epoch ms at append — lets readers order rows without filesystem clocks */
+	ts?: number;
 }
 
 export interface LoadedJournal {

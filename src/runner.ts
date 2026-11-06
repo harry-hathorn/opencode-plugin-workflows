@@ -458,7 +458,7 @@ export async function executeWorkflow(cfg: RunConfig): Promise<RunOutcome> {
 		// --- live spawn ---
 		const agentId = newAgentId();
 		const queuedAt = Date.now();
-		cfg.journal.append({ type: "started", key, agentId, label, phase: phaseTitle });
+		cfg.journal.append({ type: "started", key, agentId, label, phase: phaseTitle, ts: queuedAt });
 		upsertAgentRow(index, {
 			type: "workflow_agent",
 			index,
@@ -496,7 +496,9 @@ export async function executeWorkflow(cfg: RunConfig): Promise<RunOutcome> {
 				},
 			});
 			if (result === null) {
-				cfg.journal.append({ type: "failed", key, agentId });
+				// the agent machinery reports the reason onto the row before
+				// returning null — carry it into the journal for post-hoc reads
+				cfg.journal.append({ type: "failed", key, agentId, ts: Date.now(), error: agentRows.get(index)?.error });
 				upsertAgentRow(index, {
 					state: "error",
 					tokens: rowTokens,
@@ -505,7 +507,7 @@ export async function executeWorkflow(cfg: RunConfig): Promise<RunOutcome> {
 				});
 				return null;
 			}
-			cfg.journal.append({ type: "result", key, agentId, result: result.value });
+			cfg.journal.append({ type: "result", key, agentId, result: result.value, ts: Date.now() });
 			upsertAgentRow(index, {
 				state: "done",
 				tokens: rowTokens,
@@ -633,11 +635,13 @@ export async function executeWorkflow(cfg: RunConfig): Promise<RunOutcome> {
 	signal.addEventListener("abort", onAbortRun, { once: true });
 
 	// --- journal history ---
+	// resumed runs replicate the prior journal (cache-key prefix) and then
+	// append their own launched row — the fresh ts marks when THIS run started,
+	// so live views don't inherit the original run's age
 	if (cfg.resume) {
 		cfg.journal.replicate(cfg.resume.rows);
-	} else {
-		cfg.journal.append({ type: "launched" });
 	}
+	cfg.journal.append({ type: "launched", ts: startedAt });
 
 	// --- run ---
 	let status: RunStatus;

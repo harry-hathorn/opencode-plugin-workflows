@@ -231,6 +231,55 @@ describe("journal + resume", () => {
 		expect(rows).toEqual(["launched", "started", "result"]);
 	});
 
+	test("rows carry ts, and failed rows carry the agent-reported error", async () => {
+		const agent: AgentFn = async (_prompt, _opts, call) => {
+			call.report({ state: "error", error: "worker exploded" });
+			return null;
+		};
+		const before = Date.now();
+		const { journalFile } = await run(`${META}await agent('boom')\nreturn 1`, { agent });
+		const rows = Journal.load(journalFile).rows;
+		expect(rows.map((r) => r.type)).toEqual(["launched", "started", "failed"]);
+		for (const row of rows) expect(row.ts).toBeGreaterThanOrEqual(before);
+		const failed = rows.find((r) => r.type === "failed");
+		expect(failed?.error).toBe("worker exploded");
+	});
+
+	test("legacy journal rows without ts still resume", async () => {
+		const script = `${META}await agent('a')\nreturn 1`;
+		const first = await run(script);
+		const loaded = Journal.load(first.journalFile);
+		// simulate a pre-ts journal: strip the field, keep the cache maps
+		const legacy: typeof loaded = {
+			...loaded,
+			rows: loaded.rows.map((row) => {
+				const { ts: _ts, ...rest } = row;
+				return rest;
+			}),
+		};
+		const strict: AgentFn = async (prompt) => {
+			throw new Error(`agent must not be called on resume: ${prompt}`);
+		};
+		const second = await run(script, { agent: strict, resume: legacy });
+		expect(second.outcome.status).toBe("completed");
+	});
+
+	test("resumed runs append a fresh launched row — live views don't inherit the old age", async () => {
+		const script = `${META}await agent('a')\nreturn 1`;
+		const first = await run(script);
+		await new Promise((resolve) => setTimeout(resolve, 5));
+		const second = await run(script, {
+			agent: async () => {
+				throw new Error("agent must not be called on resume");
+			},
+			resume: Journal.load(first.journalFile),
+		});
+		expect(second.outcome.status).toBe("completed");
+		const launched = Journal.load(second.journalFile).rows.filter((r) => r.type === "launched");
+		expect(launched).toHaveLength(2); // replicated history + this run's own row
+		expect(launched[1].ts).toBeGreaterThan(launched[0].ts as number);
+	});
+
 	test("unchanged prefix replays from cache; agents are not re-run", async () => {
 		const calls: string[] = [];
 		const script = `${META}

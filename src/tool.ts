@@ -7,8 +7,6 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { ToolContext, ToolResult } from "@opencode-ai/plugin";
-import { z } from "zod";
 import { createSessionAgent, type OpencodeClient } from "./agent";
 import { compileWorkflow, MAX_SCRIPT_CHARS, WorkflowCompileError } from "./compile";
 import { isValidRunId, Journal, type LoadedJournal, newRunId, runDir, safeRunId } from "./journal";
@@ -19,6 +17,7 @@ import {
 	cloneForSandbox,
 	createSharedRunState,
 	executeWorkflow,
+	type ProgressRow,
 	WorkflowAgentCapError,
 	type WorkflowProgress,
 } from "./runner";
@@ -32,11 +31,41 @@ const RESULT_TRUNCATION = 8000;
 const ASK_SCRIPT_PREVIEW = 8000;
 const EMPTY_RESULT_RE = /^(\[\s*\]|\{\s*\}|\{\s*"[^"]+"\s*:\s*\[\s*\]\s*\})$/;
 
+/** The V2 plugin tool execution context (subset this tool uses). */
+export interface WorkflowToolContext {
+	readonly sessionID: string;
+	readonly agent: string;
+	readonly messageID: string;
+	readonly id: string;
+	readonly signal: AbortSignal;
+	readonly progress: (update: Record<string, unknown>) => Promise<void>;
+}
+
+/** V2 tool result shape: {content, metadata}. */
+export interface WorkflowToolResult {
+	content: string;
+	metadata?: Record<string, unknown>;
+}
+
+/** One launch gate = one permission.assert (custom "workflow" action). */
+export type LaunchGate = (
+	toolCtx: WorkflowToolContext,
+	dialog: {
+		resource: string;
+		title: string;
+		description: string;
+		script: string;
+		args: unknown;
+		resumeFromRunId?: string;
+	},
+) => Promise<void>;
+
 export interface WorkflowToolDeps {
 	client: OpencodeClient;
 	directory: string;
 	worktree: string;
 	budgetTotal?: number | null;
+	assertLaunch: LaunchGate;
 }
 
 /** `args` accepts any JSON; strings that look like JSON are coerced (§1). */
@@ -102,51 +131,52 @@ function currentPhaseTitle(progress: WorkflowProgress): string | undefined {
 
 export function createWorkflowTools(deps: WorkflowToolDeps) {
 	const workflowTool = {
+		name: "workflow",
 		description: WORKFLOW_TOOL_DESCRIPTION,
-		args: {
-			script: z
-				.string()
-				.max(MAX_SCRIPT_CHARS)
-				.optional()
-				.describe(
-					"Workflow script source (inline). Must begin with `export const meta = {...}` as a pure literal. Plain JavaScript, not TypeScript.",
-				),
-			name: z
-				.string()
-				.optional()
-				.describe("Saved workflow name (from .opencode/workflows or ~/.config/opencode/workflows)"),
-			scriptPath: z
-				.string()
-				.optional()
-				.describe("Path to a workflow script on disk; takes precedence over script and name"),
-			args: z
-				.any()
-				.optional()
-				.describe(
-					"Arguments for the workflow, exposed to the script as the global `args`. Pass actual JSON values, not a JSON-encoded string.",
-				),
-			resumeFromRunId: z
-				.string()
-				.regex(/^wf_[a-z0-9-]{6,}$/)
-				.optional()
-				.describe("Resume a previous run: completed agents (unchanged prompt+opts prefix) replay from cache"),
-		} satisfies z.ZodRawShape,
+		input: {
+			type: "object",
+			properties: {
+				script: {
+					type: "string",
+					maxLength: MAX_SCRIPT_CHARS,
+					description:
+						"Workflow script source (inline). Must begin with `export const meta = {...}` as a pure literal. Plain JavaScript, not TypeScript.",
+				},
+				name: {
+					type: "string",
+					description: "Saved workflow name (from .opencode/workflows or ~/.config/opencode/workflows)",
+				},
+				scriptPath: {
+					type: "string",
+					description: "Path to a workflow script on disk; takes precedence over script and name",
+				},
+				args: {
+					description:
+						"Arguments for the workflow, exposed to the script as the global `args`. Pass actual JSON values, not a JSON-encoded string.",
+				},
+				resumeFromRunId: {
+					type: "string",
+					pattern: "^wf_[a-z0-9-]{6,}$",
+					description: "Resume a previous run: completed agents (unchanged prompt+opts prefix) replay from cache",
+				},
+			},
+			additionalProperties: false,
+		} as Record<string, unknown>,
 
-		async execute(
-			input: {
+		async execute(rawInput: unknown, ctx: WorkflowToolContext): Promise<WorkflowToolResult> {
+			// JSON-Schema-typed tools arrive as unknown; narrow once, defensively
+			const input = (rawInput ?? {}) as {
 				script?: string;
 				name?: string;
 				scriptPath?: string;
 				args?: unknown;
 				resumeFromRunId?: string;
-			},
-			ctx: ToolContext,
-		): Promise<ToolResult> {
+			};
 			// Abort wiring FIRST: Esc/interrupt must never orphan live workers.
 			const runCtrl = new AbortController();
 			const onInterrupt = () => runCtrl.abort("interrupt");
-			if (ctx.abort.aborted) onInterrupt();
-			else ctx.abort.addEventListener("abort", onInterrupt, { once: true });
+			if (ctx.signal.aborted) onInterrupt();
+			else ctx.signal.addEventListener("abort", onInterrupt, { once: true });
 
 			try {
 				const workflowArgs = coerceArgs(input.args);
@@ -200,32 +230,22 @@ export function createWorkflowTools(deps: WorkflowToolDeps) {
 					}
 				}
 
-				// --- launch self-gate: one ask() per run, script shown for review ---
+				// --- launch self-gate: one permission.assert per run, script shown
+				// for review. A user rejection propagates as a Tool.Error (the
+				// model sees the reason); pre-allow with permissions:
+				//   [{"action":"workflow","resource":"*","effect":"allow"}]
 				if (!runCtrl.signal.aborted) {
-					try {
-						await ctx.ask({
-							permission: "workflow",
-							patterns: [resolvedName ?? "script"],
-							always: ["*"],
-							metadata: {
-								title: `Run workflow: ${displayName}`,
-								description: meta.description,
-								script:
-									script.length > ASK_SCRIPT_PREVIEW
-										? `${script.slice(0, ASK_SCRIPT_PREVIEW)}\n…[truncated — full script in the tool call]`
-										: script,
-								args: workflowArgs,
-								resumeFromRunId: input.resumeFromRunId,
-							},
-						});
-					} catch {
-						return {
-							title: `workflow ${displayName}: rejected`,
-							output:
-								"Workflow launch was rejected by the user. Do not retry unless the user explicitly asks again.",
-							metadata: { status: "rejected" },
-						};
-					}
+					await deps.assertLaunch(ctx, {
+						resource: resolvedName ?? "script",
+						title: `Run workflow: ${displayName}`,
+						description: meta.description,
+						script:
+							script.length > ASK_SCRIPT_PREVIEW
+								? `${script.slice(0, ASK_SCRIPT_PREVIEW)}\n…[truncated — full script in the tool call]`
+								: script,
+						args: workflowArgs,
+						resumeFromRunId: input.resumeFromRunId,
+					});
 				}
 
 				// --- run identity + script persistence (only for launched runs) ---
@@ -265,9 +285,12 @@ export function createWorkflowTools(deps: WorkflowToolDeps) {
 					lastProgress = progress;
 					const counts = countAgentStates(progress);
 					const phase = currentPhaseTitle(progress);
-					ctx.metadata({
+					ctx.progress({
 						title: `workflow ${displayName} [${runId}]${phase ? ` — ${phase}` : ""}: ${counts.done}/${progress.agentCount} agents, ${progress.totalTokens} tokens`,
-						metadata: { workflowProgress: progress, runId },
+						workflowProgress: progress,
+						runId,
+						workflowName: displayName,
+						nested: false,
 					});
 				};
 
@@ -281,6 +304,8 @@ export function createWorkflowTools(deps: WorkflowToolDeps) {
 					// workflow() nesting: children share the parent's caps, journal,
 					// abort signal, and token budget (one level, enforced by the runner).
 					const shared = createSharedRunState();
+					// child rows for the settled snapshot — parent progress excludes them
+					const nestedRuns: Array<{ name: string; status: string; rows: ProgressRow[] }> = [];
 					const nestedWorkflow = async (
 						nameOrRef: string | { scriptPath: string },
 						childArgs: unknown,
@@ -313,11 +338,19 @@ export function createWorkflowTools(deps: WorkflowToolDeps) {
 							shared,
 							onProgress: (progress) => {
 								const counts = countAgentStates(progress);
-								ctx.metadata({
+								ctx.progress({
 									title: `workflow ▸ ${childName} [${runId}]: ${counts.done}/${progress.agentCount} agents, ${progress.totalTokens} tokens`,
-									metadata: { workflowProgress: progress, runId },
+									workflowProgress: progress,
+									runId,
+									workflowName: childName,
+									nested: true,
 								});
 							},
+						});
+						nestedRuns.push({
+							name: childName,
+							status: childOutcome.status,
+							rows: childOutcome.progress.rows,
 						});
 						if (childOutcome.status === "completed") return childOutcome.result;
 						if (childOutcome.status === "failed" && childOutcome.error === agentCapError) {
@@ -365,6 +398,8 @@ export function createWorkflowTools(deps: WorkflowToolDeps) {
 						totalToolCalls: outcome.progress.totalToolCalls,
 						error: outcome.error,
 						args: workflowArgs === undefined ? undefined : cloneForSandbox(workflowArgs),
+						rows: outcome.progress.rows,
+						nested: nestedRuns.length ? nestedRuns : undefined,
 					});
 
 					const counts = countAgentStates(outcome.progress);
@@ -403,20 +438,24 @@ ${resumeHint(scriptPath, runId, workflowArgs)}
 					);
 
 					return {
-						title: `workflow ${displayName}: ${outcome.status}`,
-						output: blocks.join("\n\n"),
+						content: blocks.join("\n\n"),
 						metadata: {
+							title: `workflow ${displayName}: ${outcome.status}`,
 							runId,
 							status: outcome.status,
 							scriptPath,
 							workflowProgress: outcome.progress,
+							// keep the settled part's shape identical to the live
+							// progress metadata (the TUI reads both)
+							workflowName: displayName,
+							nested: false,
 						},
 					};
 				} finally {
 					unregisterRun(runId);
 				}
 			} finally {
-				ctx.abort.removeEventListener("abort", onInterrupt);
+				ctx.signal.removeEventListener("abort", onInterrupt);
 			}
 		},
 	};

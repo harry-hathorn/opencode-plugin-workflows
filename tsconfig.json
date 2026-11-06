@@ -1,22 +1,18 @@
 {
-  "compilerOptions": {
-    "target": "ES2023",
-    "module": "ESNext",
-    "moduleResolution": "bundler",
-    "lib": [
-      "ES2023"
-    ],
-    "types": [
-      "node"
-    ],
-    "strict": true,
-    "noUncheckedIndexedAccess": false,
-    "verbatimModuleSyntax": true,
-    "isolatedModules": true,
-    "skipLibCheck": true,
-    "noEmit": true
-  },
-  "include": [
-    "src"
-  ]
+	"compilerOptions": {
+		"target": "ES2023",
+		"module": "ESNext",
+		"moduleResolution": "bundler",
+		"lib": ["ES2023"],
+		"types": ["node"],
+		"strict": true,
+		"jsx": "react-jsx",
+		"jsxImportSource": "@opentui/solid",
+		"noUncheckedIndexedAccess": false,
+		"verbatimModuleSyntax": true,
+		"isolatedModules": true,
+		"skipLibCheck": true,
+		"noEmit": true
+	},
+	"include": ["src"]
 }

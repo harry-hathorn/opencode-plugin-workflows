@@ -24,21 +24,27 @@ jobs:
       - run: npm run build
       # Clean-room smoke test of the publishable artifact: pack the tarball,
       # install it into an empty dir (exactly what an opencode install does),
-      # then import the plugin entry and assert its shape. The bundle is
-      # self-contained (acorn/zod ship inside dist), so a missing-export or
-      # unresolved-import bug fails here and blocks the publish before a broken
-      # package reaches npm.
+      # then import both entries and assert their shapes. The server bundle is
+      # self-contained (acorn/zod ship inside dist); the TUI bundle keeps
+      # solid/@opentui external (the host remaps them onto its own instances),
+      # so the pinned versions are installed for the import check. A
+      # missing-export or unresolved-import bug fails here and blocks the
+      # publish before a broken package reaches npm.
       - name: Smoke-test publishable tarball
         run: |
           npm pack
           mkdir -p /tmp/smoke && cd /tmp/smoke
           npm init -y >/dev/null
           npm install "$GITHUB_WORKSPACE"/opencode-plugin-workflows-*.tgz
+          npm install --no-save solid-js@1.9.12 @opentui/solid@0.8.2
           node --input-type=module -e "
             const m = await import('opencode-plugin-workflows');
-            if (!m.default || m.default.id !== 'opencode-plugin-workflows' || typeof m.default.server !== 'function')
+            if (!m.default || m.default.id !== 'opencode-plugin-workflows' || typeof m.default.setup !== 'function')
               throw new Error('unexpected plugin export shape');
-            console.log('smoke: plugin entry imports and resolves');
+            const t = await import('opencode-plugin-workflows/tui');
+            if (!t.default || t.default.id !== 'opencode-plugin-workflows' || typeof t.default.setup !== 'function')
+              throw new Error('unexpected tui export shape');
+            console.log('smoke: server + tui entries import and resolve');
           "
       - run: npm publish --access public
         env:

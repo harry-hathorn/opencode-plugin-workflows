@@ -1,7 +1,6 @@
 /**
  * Module-scope state shared across the plugin's hooks and tools:
- *  - live run registry (workflow_control targets)
- *  - worker-session → run/agent mapping (event-hook progress pings, orphan sweep)
+ * the live run registry (workflow_control + TUI control-bridge targets).
  */
 import type { WorkflowProgress } from "./runner";
 
@@ -15,18 +14,8 @@ export interface LiveRun {
 	status: "running" | "completed" | "failed" | "killed" | "paused";
 }
 
-export interface WorkerPing {
-	runId: string;
-	/** bump lastProgressAt — resets stall watchdogs */
-	touch(): void;
-	reportTool(toolName: string): void;
-}
-
 /** runId → run */
 export const liveRuns = new Map<string, LiveRun>();
-
-/** worker sessionID → ping handle */
-export const workerPings = new Map<string, WorkerPing>();
 
 export function registerRun(run: LiveRun): void {
 	liveRuns.set(run.runId, run);
@@ -36,17 +25,12 @@ export function unregisterRun(runId: string): void {
 	liveRuns.delete(runId);
 }
 
-export function registerWorker(sessionID: string, ping: WorkerPing): void {
-	workerPings.set(sessionID, ping);
-}
-
-export function unregisterWorker(sessionID: string): void {
-	workerPings.delete(sessionID);
-}
-
-/** opencode permission Rule shape (wildcard, last-match-wins). */
+/**
+ * opencode V2 permission rule shape ({action, resource, effect};
+ * last-match-wins). Mirrors `PermissionRuleset` on SessionInfo.
+ */
 export interface PermissionRule {
-	permission: string;
-	pattern: string;
-	action: "allow" | "deny" | "ask";
+	action: string;
+	resource: string;
+	effect: "allow" | "deny" | "ask";
 }

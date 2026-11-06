@@ -62,6 +62,30 @@ CRITICAL: Your final text response is returned **verbatim** as a string to the c
 - Be concise. The script will parse your output.`;
 
 /**
+ * Worker contract for OpenCode V2, where plugins cannot register agents
+ * (2.2.5): the preamble rides on each worker prompt instead of replacing a
+ * system prompt. Same contract as SUBAGENT_PROMPT_TEXT.
+ */
+export const WORKER_PREAMBLE = `[workflow worker contract]
+You are a subagent spawned by a workflow orchestration script. Use the tools available to complete the task.
+
+CRITICAL: Your final text response is returned **verbatim** as a string to the calling script — it is your return value, not a message to a human.
+- Output the literal result (data, JSON, text). Do NOT output confirmations like "Done." or "Sent."
+- If asked for JSON, return ONLY the raw JSON — no code fences, no prose, no markdown.
+- Be concise. The script will parse your output.`;
+
+/**
+ * Schema-mode worker contract for OpenCode V2: there is no StructuredOutput
+ * tool, so the worker returns its answer as raw JSON in the final text
+ * response and the orchestrator parses + validates it.
+ */
+export const WORKER_NOTE_SCHEMA = `[workflow worker contract — structured mode]
+You are a subagent spawned by a workflow orchestration script. Your final answer MUST be a single raw JSON value conforming to the JSON schema below.
+- Do your work (Read files, run commands, etc.), then reply with ONLY the JSON value — no code fences, no prose, no markdown.
+- The script parses your final text response as JSON; anything else is a validation failure and the task is retried.
+- After the JSON value, end your turn. No acknowledgment needed.`;
+
+/**
  * workflow-subagent system prompt, schema mode.
  * In opencode this is delivered by REPLACING the text-mode prompt: schema-mode
  * workers run as the same agent but the schema note is appended via the prompt's
@@ -117,23 +141,33 @@ export const agentCapError =
 	"Workflow agent() call cap reached (1000). This usually means a loop using budget.remaining() never terminates because no token budget was set — remaining() returns Infinity when budget.total is null. Add a hard iteration cap to the loop, or pass a token budget.";
 
 /**
- * Saved-workflow slash-command template (§7, `getPromptForCommand`).
- * `$ARGUMENTS` is expanded by opencode's command machinery.
+ * Saved-workflow command text (§7). In V1 `$ARGUMENTS` was expanded by
+ * opencode's template machinery; in V2 the plugin's command executor receives
+ * the raw argument text and expands it itself via `argsText`.
  */
-export function workflowCommandTemplate(wf: {
-	name: string;
-	description: string;
-	whenToUse?: string;
-	phases?: { title: string; detail?: string }[];
-}): string {
+export function workflowCommandTemplate(
+	wf: {
+		name: string;
+		description: string;
+		whenToUse?: string;
+		phases?: { title: string; detail?: string }[];
+	},
+	argsText?: string,
+): string {
 	const lines = [`Run the \`${wf.name}\` workflow.`, wf.description];
 	if (wf.whenToUse) lines.push(wf.whenToUse);
 	if (wf.phases?.length) {
 		lines.push("Phases:");
 		for (const p of wf.phases) lines.push(`- ${p.title}${p.detail ? `: ${p.detail}` : ""}`);
 	}
-	lines.push(`Invoke the workflow tool with: { "name": "${wf.name}", "args": $ARGUMENTS }`);
-	lines.push("If $ARGUMENTS is empty, omit the args field.");
+	const args = argsText?.trim();
+	if (args) {
+		lines.push(`Invoke the workflow tool with: { "name": "${wf.name}", "args": ${args} }`);
+	} else {
+		lines.push(
+			`Invoke the workflow tool with: { "name": "${wf.name}" } — no arguments were provided, so omit the args field.`,
+		);
+	}
 	return lines.join("\n");
 }
 

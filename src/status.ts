@@ -5,8 +5,9 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { applyControlOp, type WorkflowControlOp } from "./control";
 import { runsRoot } from "./journal";
-import { resumeHint } from "./prompts";
+import type { ProgressRow } from "./runner";
 import { liveRuns } from "./state";
 
 export interface RunSnapshot {
@@ -23,6 +24,10 @@ export interface RunSnapshot {
 	totalToolCalls: number;
 	error?: string;
 	args?: unknown;
+	/** settled progress rows — the TUI renders the full tree for settled runs */
+	rows?: ProgressRow[];
+	/** nested workflow() children (own rows; the parent progress excludes them) */
+	nested?: Array<{ name: string; status: string; rows: ProgressRow[] }>;
 }
 
 export function snapshotPath(runId: string): string {
@@ -113,36 +118,12 @@ export function workflowStatusOutput(): string {
 	return `${out}\n\nUse workflow_control with a runId to kill/pause a running workflow. Paused or killed runs resume via the workflow tool: workflow({scriptPath, resumeFromRunId}) — completed agents return cached results.`;
 }
 
-export type WorkflowControlOp = "kill" | "pause";
+export type { WorkflowControlOp };
 
+/**
+ * Thin delegate — kill/pause semantics live in control.applyControlOp so the
+ * workflow_control tool and the TUI control bridge share one implementation.
+ */
 export function workflowControlOutput(runId: string, op: WorkflowControlOp): { output: string; ok: boolean } {
-	const run = liveRuns.get(runId);
-	if (!run) {
-		return {
-			output: `No live workflow with runId ${runId}. Call workflow_status to list runs.`,
-			ok: false,
-		};
-	}
-	if (run.status !== "running") {
-		return { output: `Workflow ${runId} already ${run.status}.`, ok: false };
-	}
-	run.abort(op === "pause" ? "user-pause" : "user-kill");
-	if (op === "pause") {
-		return {
-			output: `Workflow ${run.name} [${runId}] paused. In-flight agents were aborted; completed agent results are preserved in the journal. ${resumeHintFor(runId)}`,
-			ok: true,
-		};
-	}
-	return { output: `Workflow ${run.name} [${runId}] killed. ${resumeHintFor(runId)}`, ok: true };
-}
-
-function resumeHintFor(runId: string): string {
-	// snapshot knows the persisted script path
-	try {
-		const snap = JSON.parse(fs.readFileSync(snapshotPath(runId), "utf8")) as RunSnapshot & { scriptPath?: string };
-		if (snap.scriptPath) return resumeHint(snap.scriptPath, runId, snap.args);
-	} catch {
-		// snapshot not written yet (still running) — generic hint
-	}
-	return `Resume with: workflow({scriptPath: <script path>, resumeFromRunId: '${runId}'}) — completed agents return cached results.`;
+	return applyControlOp({ runId, op });
 }
