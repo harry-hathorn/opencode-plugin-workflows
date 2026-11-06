@@ -16,13 +16,7 @@
  * errored tool call, else findLast text part.
  */
 
-import {
-	CUSTOM_AGENT_NOTE_SCHEMA,
-	CUSTOM_AGENT_NOTE_TEXT,
-	WORKER_NOTE_SCHEMA,
-	WORKER_PREAMBLE,
-	worktreeNote,
-} from "./prompts";
+import { CUSTOM_AGENT_NOTE_TEXT, WORKER_NOTE_SCHEMA, WORKER_PREAMBLE, worktreeNote } from "./prompts";
 import type { AgentFn, AgentOptions } from "./runner";
 import type { PermissionRule } from "./state";
 
@@ -90,12 +84,14 @@ function parseModelSpec(spec: string): { providerID: string; modelID: string } |
 }
 
 /**
- * Build the worker ruleset: inherited denies, disallowedTools denies, and a
- * hard deny for subagent spawning (workflow children cannot spawn tasks —
- * keeps the workflow tree flat and free of runaway nested runs).
+ * Build the worker ruleset. Ordered last-match-wins, so the edit allow LEADS:
+ * workers default to friction-free file edits (V1's workflow-subagent carried
+ * `edit: allow`), while every deny — inherited parent denies, disallowedTools,
+ * and the hard subagent-spawn deny — comes later and therefore wins.
  */
 function workerRuleset(parent: ParentInfo, opts: AgentOptions): PermissionRule[] {
-	const rules: PermissionRule[] = [...parent.denies];
+	const rules: PermissionRule[] = [{ action: "edit", resource: "*", effect: "allow" }];
+	rules.push(...parent.denies);
 	for (const tool of opts.disallowedTools ?? []) {
 		if (typeof tool !== "string" || !tool.trim()) continue;
 		rules.push({ action: tool.trim(), resource: "*", effect: "deny" });
@@ -373,4 +369,4 @@ export async function createSessionAgent(init: SessionAgentInit): Promise<AgentF
 	};
 }
 
-export { CUSTOM_AGENT_NOTE_SCHEMA, CUSTOM_AGENT_NOTE_TEXT };
+export { CUSTOM_AGENT_NOTE_TEXT };

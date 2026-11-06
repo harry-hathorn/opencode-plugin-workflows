@@ -321,8 +321,12 @@ export function Dashboard(props: {
 					))}
 				</box>
 			),
-			() => props.context.ui.dialog.clear(),
+			() => {
+				dialogs.end();
+				props.context.ui.dialog.clear();
+			},
 		);
+		dialogs.begin();
 		props.context.ui.dialog.set({ size: "large" });
 	}
 

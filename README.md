@@ -107,7 +107,8 @@ Add to `.opencode/opencode.json` (project) or `~/.config/opencode/opencode.json`
 One entry loads every part — the tools and commands in the server, the sidebar section and
 dashboard in the TUI. (Local checkout: `"file:///abs/path/to/opencode-plugin-workflows"`.)
 
-Launching a workflow pops **one** approval dialog showing the full script. Pre-allow it:
+Launching a workflow asks **once** — a permission prompt on the `workflow` action carrying
+the run's name, description, script, and args (pre-allow it below to skip entirely):
 
 ```json
 {

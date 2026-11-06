@@ -49,22 +49,10 @@ return { confirmed }
 Resume: the tool result includes a runId. To resume after a pause, kill, or script edit, re-invoke with {scriptPath, resumeFromRunId} — the longest unchanged prefix of agent() calls returns cached results instantly. Date.now()/Math.random()/argless new Date() are unavailable in scripts (they would break resume).`;
 
 /**
- * workflow-subagent system prompt, default text mode.
- * The "SendUserMessage" bullet is dropped — that tool does not exist in opencode.
- * Registered as the agent's `prompt` in the config hook (agent prompts REPLACE
- * the default system prompt).
- */
-export const SUBAGENT_PROMPT_TEXT = `You are a subagent spawned by a workflow orchestration script. Use the tools available to complete the task.
-
-CRITICAL: Your final text response is returned **verbatim** as a string to the calling script — it is your return value, not a message to a human.
-- Output the literal result (data, JSON, text). Do NOT output confirmations like "Done." or "Sent."
-- If asked for JSON, return ONLY the raw JSON — no code fences, no prose, no markdown.
-- Be concise. The script will parse your output.`;
-
 /**
  * Worker contract for OpenCode V2, where plugins cannot register agents
  * (2.2.5): the preamble rides on each worker prompt instead of replacing a
- * system prompt. Same contract as SUBAGENT_PROMPT_TEXT.
+ * system prompt. Same contract as the V1 workflow-subagent system prompt.
  */
 export const WORKER_PREAMBLE = `[workflow worker contract]
 You are a subagent spawned by a workflow orchestration script. Use the tools available to complete the task.
@@ -86,29 +74,12 @@ You are a subagent spawned by a workflow orchestration script. Your final answer
 - After the JSON value, end your turn. No acknowledgment needed.`;
 
 /**
- * workflow-subagent system prompt, schema mode.
- * In opencode this is delivered by REPLACING the text-mode prompt: schema-mode
- * workers run as the same agent but the schema note is appended via the prompt's
- * `system` parameter (PromptInput.system appends to the agent prompt).
- */
-export const SUBAGENT_PROMPT_SCHEMA = `You are a subagent spawned by a workflow orchestration script. Use the tools available to complete the task.
-
-CRITICAL: You MUST call the StructuredOutput tool exactly once to return your final answer. The tool's input schema defines the required shape.
-- Do your work (Read files, run commands, etc.), then call StructuredOutput with your answer.
-- Do NOT put your answer in a text response. The script reads ONLY the StructuredOutput tool call.
-- If the schema validation fails, read the error and call StructuredOutput again with a corrected shape.
-- After calling StructuredOutput successfully, end your turn. No acknowledgment needed.`;
-
 /** Note appended to custom agentType prompts, text mode. */
 export const CUSTOM_AGENT_NOTE_TEXT = `---
 
 NOTE: You are running inside a workflow script. Your final text response is returned verbatim as a string to the calling script — it is your return value, not a message to a human. Output the literal result; do not output confirmations like "Done." Be concise — the script will parse your output.`;
 
 /** Note appended to custom agentType prompts, schema mode. */
-export const CUSTOM_AGENT_NOTE_SCHEMA = `---
-
-NOTE: You are running inside a workflow script. You MUST return your final answer by calling the StructuredOutput tool exactly once — the tool's input schema defines the required shape. Do your work, then call StructuredOutput; do NOT put your answer in a text response (the script reads ONLY the tool call). If validation fails, read the error and call StructuredOutput again with a corrected shape.`;
-
 /** Worktree isolation note (`isolation: 'worktree'`), appended to the agent prompt. */
 export function worktreeNote(worktreePath: string, cwd: string): string {
 	return `---
@@ -175,6 +146,5 @@ export function workflowCommandTemplate(
 export const WORKFLOWS_COMMAND_TEMPLATE = `Show the user's workflows. Call the workflow_status tool (no arguments) and relay a concise summary: for each run — name, status, agents done/total, tokens, duration. If any run is still running, mention that the workflow_control tool can kill or pause it (give the runId). For incomplete runs, offer to resume with the workflow tool ({scriptPath, resumeFromRunId}) — completed agents return cached results.`;
 
 /** workflow-subagent agent definition registered via the config hook. */
-export const SUBAGENT_AGENT_NAME = "workflow-subagent";
 export const SUBAGENT_AGENT_DESCRIPTION =
 	"Internal subagent for workflow script orchestration. Its final text response is returned verbatim to the calling workflow script.";

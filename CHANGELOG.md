@@ -36,6 +36,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - V2 CI smoke test: the publishable tarball must import both entries and expose the
   `Plugin.define` shape (`{id, setup}`) with OpenTUI 0.8.2 peers installed.
 
+### Fixed
+- **Packaging (would have blocked the 0.4.0 publish)** — `dist` imports `@opencode/plugin`
+  at runtime but it lived in devDependencies: the release smoke test (tarball installed into
+  an empty dir) failed to resolve it, and npm consumers would too. `@opencode/plugin` is now
+  a dependency and `solid-js` / `@opentui/core` / `@opentui/solid` are declared
+  peerDependencies, matching the V2 plugin package layout. Verified by running the release
+  smoke test locally against the packed tarball.
+- **Workers get friction-free edits back** — V1's workflow-subagent carried `edit: allow`;
+  the port's worker ruleset only added denies, so under an ask-by-default config workers
+  stalled on permission prompts nobody answers (180s stall watchdog → interrupt → retry →
+  agent failure after 5 attempts). The ruleset now leads with `{edit, *, allow}` and keeps
+  every deny (inherited parent denies, `disallowedTools`, subagent-spawn) later in the list
+  so denies still win under last-match-wins. Verified live: a child session reports exactly
+  `[{edit,*,allow},{subagent,*,deny}]`.
+- **Help dialog now quiets the dashboard keymap** — `dialog.show()` bypassed the dialog
+  tracker, so `x`/`p` could stack a confirm on top of help and `q` closed both. The tracker
+  gained `begin()`/`end()` and `openHelp` brackets its modal with them.
+- Removed dead exports (`SUBAGENT_PROMPT_*`, `SUBAGENT_AGENT_*`, `CUSTOM_AGENT_NOTE_SCHEMA`)
+  and a dead `delivery ?? "steer"` fallback.
+
+### Verified
+- End-to-end run on OpenCode 2.2.5: launch gate (pre-allowed path) → child session (build
+  agent, correct parent, worker permissions) → prompt/wait/context → verbatim extraction →
+  journal + snapshot on disk → `workflow_status` reads it back.
+- Transcript tool items persist `state.metadata` (197/197 items in a live transcript), so
+  the TUI store's settled-scan shape is correct. Note: through Code Mode, workflow calls are
+  nested under the `execute` envelope without our result metadata — live journal + settled
+  snapshot remain the canonical evidence paths (they are Code-Mode-independent and verified).
+- One check remains manual: how much of the permission prompt's metadata (script preview
+  etc.) the TUI renders — run any workflow without a pre-allow rule to see it.
+
 ## [0.3.0] - 2026-09-13
 
 ### Added
